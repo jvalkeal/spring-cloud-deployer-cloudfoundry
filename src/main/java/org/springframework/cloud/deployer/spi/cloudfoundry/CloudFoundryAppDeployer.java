@@ -23,7 +23,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 
 import org.cloudfoundry.doppler.LogMessage;
 import org.cloudfoundry.operations.CloudFoundryOperations;
@@ -43,8 +47,11 @@ import org.cloudfoundry.operations.applications.StartApplicationRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yaml.snakeyaml.Yaml;
+
+import reactor.cache.CacheMono;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Signal;
 
 import org.springframework.cloud.deployer.spi.app.AppDeployer;
 import org.springframework.cloud.deployer.spi.app.AppScaleRequest;
@@ -135,6 +142,12 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 			.block();
 	}
 
+	@Override
+	public Mono<Map<String, DeploymentState>> statesReactive(String... ids) {
+		return requestSummary()
+			.collect(Collectors.toMap(ApplicationSummary::getName, this::mapShallowAppState));
+	}
+
 	private DeploymentState mapShallowAppState(ApplicationSummary applicationSummary) {
 		if (applicationSummary.getRunningInstances().equals(applicationSummary.getInstances())) {
 			return DeploymentState.deployed;
@@ -173,6 +186,7 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 
 	@Override
 	public AppStatus status(String id) {
+		logger.info("XXX status for {}", id);
 		try {
 			return getStatus(id)
 				.doOnSuccess(v -> logger.info("Successfully computed status [{}] for {}", v, id))
@@ -183,6 +197,11 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 			logger.error("Caught exception while querying for status of {}", id, timeoutDueToBlock);
 			return createErrorAppStatus(id);
 		}
+	}
+
+	@Override
+	public Mono<AppStatus> statusReactive(String id) {
+		return getStatus(id);
 	}
 
 	@Override
@@ -363,7 +382,7 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 		} else {
 			manifest.buildpack(buildpack(request));
 		}
-		
+
 		if (!includesServiceParameters(request)) {
 			return pushApplicationWithNoServiceParameters(manifest.build(), deploymentId);
 		} else {
@@ -420,7 +439,31 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 				.build());
 	}
 
+	Cache<String, ApplicationDetail> cache = Caffeine.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS).build();
+
 	private Mono<ApplicationDetail> requestGetApplication(String id) {
+		logger.info("XXX requestGetApplication {}", id);
+		Mono<ApplicationDetail> cachedMono = CacheMono
+			// .lookup(k -> Mono.justOrEmpty(cache.getIfPresent(id)).map(Signal::next), id)
+			.lookup(k -> Mono.defer(() -> {
+				ApplicationDetail ifPresent = cache.getIfPresent(id);
+				logger.info("XXX get {}", ifPresent);
+				return Mono.justOrEmpty(ifPresent).map(Signal::next);
+			}), id)
+			// .onCacheMissResume(requestGetApplicationx(id))
+			.onCacheMissResume(Mono.defer(() -> {
+				logger.info("XXX cache miss {}", id);
+				return requestGetApplicationx(id);
+			}))
+			.andWriteWith((k, sig) -> Mono.fromRunnable(() -> {
+				logger.info("XXX cache put {} {}", k, sig.get());
+				cache.put(k, sig.get());
+			}))
+			;
+		return cachedMono;
+	}
+
+	private Mono<ApplicationDetail> requestGetApplicationx(String id) {
 		return this.operations.applications()
 			.get(GetApplicationRequest.builder()
 				.name(id)
