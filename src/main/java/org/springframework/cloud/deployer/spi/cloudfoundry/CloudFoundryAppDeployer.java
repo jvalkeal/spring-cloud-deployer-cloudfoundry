@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2018 the original author or authors.
+ * Copyright 2016-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -89,6 +89,9 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 	private final AppNameGenerator applicationNameGenerator;
 
 	private final CloudFoundryOperations operations;
+
+	private final Cache<String, ApplicationDetail> cache = Caffeine.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS)
+			.build();
 
 	public CloudFoundryAppDeployer(AppNameGenerator applicationNameGenerator,
 		CloudFoundryDeploymentProperties deploymentProperties,
@@ -186,7 +189,6 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 
 	@Override
 	public AppStatus status(String id) {
-		logger.info("XXX status for {}", id);
 		try {
 			return getStatus(id)
 				.doOnSuccess(v -> logger.info("Successfully computed status [{}] for {}", v, id))
@@ -439,24 +441,19 @@ public class CloudFoundryAppDeployer extends AbstractCloudFoundryDeployer implem
 				.build());
 	}
 
-	Cache<String, ApplicationDetail> cache = Caffeine.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS).build();
-
 	private Mono<ApplicationDetail> requestGetApplication(String id) {
-		logger.info("XXX requestGetApplication {}", id);
 		Mono<ApplicationDetail> cachedMono = CacheMono
-			// .lookup(k -> Mono.justOrEmpty(cache.getIfPresent(id)).map(Signal::next), id)
 			.lookup(k -> Mono.defer(() -> {
 				ApplicationDetail ifPresent = cache.getIfPresent(id);
-				logger.info("XXX get {}", ifPresent);
+				logger.debug("Cache get {}", ifPresent);
 				return Mono.justOrEmpty(ifPresent).map(Signal::next);
 			}), id)
-			// .onCacheMissResume(requestGetApplicationx(id))
 			.onCacheMissResume(Mono.defer(() -> {
-				logger.info("XXX cache miss {}", id);
+				logger.debug("Cache miss {}", id);
 				return requestGetApplicationx(id);
 			}))
 			.andWriteWith((k, sig) -> Mono.fromRunnable(() -> {
-				logger.info("XXX cache put {} {}", k, sig.get());
+				logger.debug("Cache put {} {}", k, sig.get());
 				cache.put(k, sig.get());
 			}))
 			;
